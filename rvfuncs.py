@@ -21,7 +21,7 @@ plt.rcParams.update({"font.size": 14})
 c_kms = 299792.458
 
 # ============================================================
-# 10. GAUSSIAN RV FITTING
+# CORE GAUSSIAN MODEL
 # ============================================================
 
 def gaussian(x, amp, mu, sigma, cont):
@@ -34,44 +34,91 @@ def doppler_rv(lambda_obs, lambda_rest):
     return c_kms * (lambda_obs - lambda_rest) / lambda_rest
 
 
-def measure_rv_epoch(wave, flux, lambda_rest, window=15.0, emission=False, return_fit=False, min_points=20, min_depth=0.01, min_sigma=0.25, max_sigma=5.0, mu_guard=3.0, max_rv_err=30.0):
-    """Fit one Gaussian line and return RV and RV uncertainty."""
-    wave, flux = np.asarray(wave, dtype=float), np.asarray(flux, dtype=float)
+# ============================================================
+# SINGLE-LINE RV MEASUREMENT
+# ============================================================
 
-    mask = (wave >= lambda_rest - window) & (wave <= lambda_rest + window) & np.isfinite(wave) & np.isfinite(flux)
+def measure_rv_epoch(wave, flux, lambda_rest, window=15.0,
+                     emission=False, return_fit=False,
+                     min_points=20, min_depth=0.01,
+                     min_sigma=0.25, max_sigma=5.0,
+                     mu_guard=3.0, max_rv_err=30.0,
+                     expected_rv=0.0):
+    """
+    Fit one Gaussian line profile and return RV and RV uncertainty.
+
+    Parameters
+    ----------
+    wave, flux    : array-like  normalised spectrum
+    lambda_rest   : float       rest wavelength [AA]
+    window        : float       half-window width [AA]
+    emission      : bool        True for emission lines
+    return_fit    : bool        if True, return (rv, rv_err, lmfit_result)
+    min_points    : int         minimum pixels inside window
+    min_depth     : float       minimum line depth (fraction of continuum)
+    min_sigma     : float       minimum allowed Gaussian sigma [AA]
+    max_sigma     : float       maximum allowed Gaussian sigma [AA]
+    mu_guard      : float       max allowed centre shift from expected [AA]
+    max_rv_err    : float       reject fit if RV uncertainty > this [km/s]
+    expected_rv   : float       prior on systemic RV used to centre mu bounds
+
+    Returns
+    -------
+    (rv, rv_err)                        if return_fit=False
+    (rv, rv_err, lmfit.ModelResult)     if return_fit=True
+    NaN values are returned on failure.
+    """
+    wave = np.asarray(wave, dtype=float)
+    flux = np.asarray(flux, dtype=float)
+
+    mask = (
+        (wave >= lambda_rest - window) &
+        (wave <= lambda_rest + window) &
+        np.isfinite(wave) &
+        np.isfinite(flux)
+    )
 
     if np.sum(mask) < min_points:
-        result = (np.nan, np.nan, None)
-        return result if return_fit else result[:2]
+        out = (np.nan, np.nan, None)
+        return out if return_fit else out[:2]
 
     x, y = wave[mask], flux[mask]
 
+    # Initial parameter guesses
     if emission:
-        idx = np.argmax(y)
-        mu0 = x[idx]
-        amp0 = max(y[idx] - 1.0, min_depth)
+        idx   = np.argmax(y)
+        mu0   = x[idx]
+        amp0  = max(y[idx] - 1.0, min_depth)
         amp_min, amp_max = min_depth, max(1.0, amp0 * 5)
-    else:
-        idx = np.argmin(y)
-        mu0 = x[idx]
-        amp0 = min(y[idx] - 1.0, -min_depth)
-        amp_min, amp_max = min(-min_depth, amp0 * 5), -min_depth
-
-    if emission:
         depth = np.nanmax(y) - 1.0
     else:
+        idx   = np.argmin(y)
+        mu0   = x[idx]
+        amp0  = min(y[idx] - 1.0, -min_depth)
+        amp_min, amp_max = min(-min_depth, amp0 * 5), -min_depth
         depth = 1.0 - np.nanmin(y)
 
     if not np.isfinite(depth) or depth < min_depth:
-        result = (np.nan, np.nan, None)
-        return result if return_fit else result[:2]
+        out = (np.nan, np.nan, None)
+        return out if return_fit else out[:2]
 
-    model = Model(gaussian)
-    params = model.make_params(amp=amp0, mu=mu0, sigma=0.8, cont=1.0)
-    params["amp"].set(min=amp_min, max=amp_max)
-    params["mu"].set(min=mu0 - mu_guard, max=mu0 + mu_guard)
+    # Centre bounds: guard against locking onto a neighbouring line
+    mu_expected = lambda_rest * (1.0 + expected_rv / c_kms)
+    mu_min      = mu_expected - mu_guard
+    mu_max      = mu_expected + mu_guard
+    mu_initial  = np.clip(mu0, mu_min + 1e-4, mu_max - 1e-4)
+
+    model  = Model(gaussian)
+    params = model.make_params(
+        amp=amp0,
+        mu=mu_initial,
+        sigma=0.8,
+        cont=1.0,
+    )
+    params["amp"].set(min=amp_min,  max=amp_max)
+    params["mu"].set( min=mu_min,   max=mu_max)
     params["sigma"].set(min=min_sigma, max=max_sigma)
-    params["cont"].set(min=0.5, max=1.5)
+    params["cont"].set( min=0.5,    max=1.5)
 
     try:
         result = model.fit(y, params, x=x)
@@ -79,49 +126,517 @@ def measure_rv_epoch(wave, flux, lambda_rest, window=15.0, emission=False, retur
         result = None
 
     if result is None or not result.success:
-        output = (np.nan, np.nan, result)
-        return output if return_fit else output[:2]
+        out = (np.nan, np.nan, result)
+        return out if return_fit else out[:2]
 
-    mu = result.params["mu"].value
+    mu     = result.params["mu"].value
     mu_err = result.params["mu"].stderr
-    rv = doppler_rv(mu, lambda_rest)
+    rv     = doppler_rv(mu, lambda_rest)
     rv_err = np.nan if mu_err is None else abs(c_kms * mu_err / lambda_rest)
 
     if np.isfinite(rv_err) and rv_err > max_rv_err:
         rv, rv_err = np.nan, np.nan
 
-    output = (rv, rv_err, result)
-    return output if return_fit else output[:2]
+    out = (rv, rv_err, result)
+    return out if return_fit else out[:2]
 
 
-def plot_line_fit(wave, flux, lambda_rest, result, window=15.0, title="Line Fit", save_path=None):
-    """Plot one Gaussian line fit."""
-    mask = (wave >= lambda_rest - window) & (wave <= lambda_rest + window)
-    x, y = np.asarray(wave)[mask], np.asarray(flux)[mask]
+def plot_line_fit(wave, flux, lambda_rest, result, window=15.0,
+                  title="Line Fit", save_path=None, ax=None):
+    """Plot one Gaussian fit, optionally on an existing subplot."""
+    wave = np.asarray(wave)
+    flux = np.asarray(flux)
 
-    if len(x) == 0:
+    mask = (
+        (wave >= lambda_rest - window)
+        & (wave <= lambda_rest + window)
+        & np.isfinite(wave)
+        & np.isfinite(flux)
+    )
+    x, y = wave[mask], flux[mask]
+
+    if x.size == 0:
         raise ValueError("No data inside line-fitting window.")
+
+    if ax is None:
+        fig, axis = plt.subplots(figsize=(10, 6))
+    else:
+        axis = ax
+        fig = axis.figure
 
     xfine = np.linspace(x.min(), x.max(), 300)
     yfit = result.model.eval(result.params, x=xfine)
 
-    fig, axis = plt.subplots(figsize=(10, 6))
-    axis.plot(x, y, "k-", label="Spectrum")
-    axis.plot(xfine, yfit, "r-", lw=2, label="Gaussian fit")
-    axis.axvline(lambda_rest, ls="--", alpha=0.5, label="Rest wavelength")
-    axis.axhline(1, ls=":", alpha=0.5)
-    axis.set_xlabel(r"Wavelength [$\AA$]")
-    axis.set_ylabel("Normalized Flux")
+    axis.plot(x, y, "k-", lw=0.8, label="Spectrum")
+    axis.plot(xfine, yfit, "r-", lw=1.2, label="Gaussian fit")
+    axis.axvline(
+        lambda_rest, color="gray", ls="--",
+        lw=0.7, alpha=0.5, label="Rest wavelength",
+    )
+    axis.axhline(1, color="gray", ls=":", lw=0.7, alpha=0.5)
+    axis.set_xlabel("Wavelength [Å]")
+    axis.set_ylabel("Normalized flux")
     axis.set_title(title)
     axis.grid(alpha=0.3)
-    axis.legend()
-    plt.tight_layout()
+
+    # Avoid adding a legend and applying layout for every grid panel.
+    if ax is None:
+        axis.legend()
+        fig.tight_layout()
 
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
     return fig, axis
 
+# ============================================================
+# SELECTED-LINE EPOCH WORKFLOW
+# Uses the existing measure_rv_epoch; no second RV fitter.
+# ============================================================
+
+def measure_epoch(
+    wave,
+    flux,
+    filename,
+    bjd,
+    *,
+    primary_lines,
+    secondary_lines,
+    expected_rv,
+    min_lines_for_mean,
+    special_params=None,
+    verbose=True,
+):
+    """Measure selected lines and preserve the notebook's group statistics.
+
+    Line dictionaries:
+        line name -> (rest wavelength [Angstrom], half-window [Angstrom])
+
+    Preserves:
+    - existing single-line fitting implementation;
+    - max_sigma and mu_guard per-line settings;
+    - equal-weight group and combined means;
+    - combined sample standard deviation;
+    - existing returned dictionary keys.
+
+    Group names are legacy labels, not stellar identifications.
+    Does not read files, plot or save outputs.
+    """
+    lines = {**primary_lines, **secondary_lines}
+    special_params = {} if special_params is None else special_params
+
+    rvs = {}
+    errors = {}
+    fits_by_line = {}
+
+    for line_name, (lambda_rest, window) in lines.items():
+        settings = special_params.get(line_name, {})
+
+        try:
+            rv, rv_err, result = measure_rv_epoch(
+                wave,
+                flux,
+                lambda_rest,
+                window=window,
+                return_fit=True,
+                expected_rv=expected_rv,
+                max_sigma=settings.get("max_sigma", 5.0),
+                mu_guard=settings.get("mu_guard", 3.0),
+            )
+        except Exception as exc:
+            if verbose:
+                print(f"  {line_name}: fitting failed: {exc}")
+
+            rv, rv_err, result = np.nan, np.nan, None
+
+        rvs[line_name] = (
+            float(rv)
+            if rv is not None and np.isfinite(rv)
+            else np.nan
+        )
+        errors[line_name] = (
+            float(rv_err)
+            if rv_err is not None and np.isfinite(rv_err)
+            else np.nan
+        )
+        fits_by_line[line_name] = result
+
+        if verbose:
+            if np.isfinite(rvs[line_name]):
+                suffix = (
+                    f" +/- {errors[line_name]:.2f}"
+                    if np.isfinite(errors[line_name])
+                    else " (uncertainty unavailable)"
+                )
+                print(
+                    f"  {line_name:14s}: "
+                    f"{rvs[line_name]:8.2f} km/s" + suffix
+                )
+            else:
+                print(f"  {line_name:14s}: FAILED")
+
+    primary_values = [
+        rvs[name]
+        for name in primary_lines
+        if np.isfinite(rvs[name])
+    ]
+    secondary_values = [
+        rvs[name]
+        for name in secondary_lines
+        if np.isfinite(rvs[name])
+    ]
+    candidate_values = [
+        rvs[name]
+        for name in lines
+        if np.isfinite(rvs[name])
+    ]
+
+    if len(candidate_values) >= min_lines_for_mean:
+        mean_rv = float(np.mean(candidate_values))
+        line_scatter = (
+            float(np.std(candidate_values, ddof=1))
+            if len(candidate_values) > 1
+            else np.nan
+        )
+    else:
+        mean_rv = np.nan
+        line_scatter = np.nan
+
+    return {
+        "filename": filename,
+        "BJD": bjd,
+        "wave": wave,
+        "flux": flux,
+        "rvs": rvs,
+        "errors": errors,
+        "fits": fits_by_line,
+        "mean_RV_kms": mean_rv,
+        "line_scatter_kms": line_scatter,
+        "N_mean_lines": len(candidate_values),
+        "primary_mean_RV_kms": (
+            float(np.mean(primary_values))
+            if primary_values else np.nan
+        ),
+        "N_primary_lines": len(primary_values),
+        "secondary_mean_RV_kms": (
+            float(np.mean(secondary_values))
+            if secondary_values else np.nan
+        ),
+        "N_secondary_lines": len(secondary_values),
+    }
+
+
+# ============================================================
+# VELOCITY-SPACE GAUSSIAN
+# Distinct from the existing wavelength-space gaussian().
+# ============================================================
+
+def gaussian_vel(v, continuum, slope, depth, centre, width):
+    """Absorption Gaussian in velocity space with a linear continuum.
+
+    v, centre and width: km/s.
+    width: Gaussian sigma, not FWHM.
+    depth: positive for absorption.
+    slope: uses the original v / 200 scaling.
+    """
+    return (
+        continuum
+        + slope * v / 200.0
+        - depth * np.exp(
+            -0.5 * ((v - centre) / width) ** 2
+        )
+    )
+
+
+# ============================================================
+# PROFILE REGISTRATION
+# Preserves the notebook's registration fitting procedure.
+# ============================================================
+
+def fit_registration_profile(
+    wave,
+    flux,
+    initial,
+    *,
+    rest_a,
+    shift_kms,
+    view_half,
+    fit_half,
+    cont_bounds,
+    local_continuum,
+):
+    """Fit one profile for apparent velocity registration.
+
+    Parameters
+    ----------
+    wave, flux
+        Wavelength [Angstrom] and supplied normalized flux.
+    initial
+        Initial RV [km/s], also used to centre the selection windows.
+    rest_a
+        Rest wavelength in the same convention as wave.
+    shift_kms
+        Explicit additive velocity correction.
+    view_half, fit_half
+        Viewing and fitting half-ranges [km/s].
+    cont_bounds
+        Inner and outer continuum-sideband offsets [km/s].
+    local_continuum
+        Whether to divide by a clipped linear sideband continuum.
+
+    Returns
+    -------
+    dict
+        v, flux, RV, bound_hit and parameters.
+
+    File identifiers, BJD, epoch labels and colours are supplied separately
+    by the calling notebook.
+
+    Returned RV is a registration diagnostic, not a separated stellar RV.
+    Does not load spectra, infer wavelength conventions, plot or save.
+    """
+    if not np.isfinite(initial) or not np.isfinite(shift_kms):
+        raise ValueError(
+            "Invalid initial RV or velocity correction."
+        )
+
+    wave = np.asarray(wave, dtype=float)
+    flux = np.asarray(flux, dtype=float)
+
+    v = c_kms * (wave / rest_a - 1.0) + shift_kms
+
+    extraction_half = max(
+        view_half + abs(initial) + 150.0,
+        cont_bounds[1] + abs(initial),
+    )
+
+    use = (
+        np.isfinite(v)
+        & np.isfinite(flux)
+        & (np.abs(v) <= extraction_half)
+    )
+    v, f = v[use], flux[use]
+
+    side = (
+        (np.abs(v - initial) >= cont_bounds[0])
+        & (np.abs(v - initial) <= cont_bounds[1])
+    )
+
+    if (
+        side.sum() < 10
+        or not np.any(v[side] < initial)
+        or not np.any(v[side] > initial)
+    ):
+        raise ValueError(
+            "Insufficient continuum on both sides."
+        )
+
+    continuum = np.ones_like(f)
+
+    if local_continuum:
+        keep = side.copy()
+        x_local = (v - initial) / 200.0
+
+        for _ in range(3):
+            coef = np.polyfit(
+                x_local[keep],
+                f[keep],
+                1,
+            )
+            continuum = np.polyval(coef, x_local)
+            residual = f - continuum
+
+            centre_resid = np.median(residual[keep])
+            scatter = 1.4826 * np.median(
+                np.abs(residual[keep] - centre_resid)
+            )
+
+            if not np.isfinite(scatter) or scatter <= 0:
+                break
+
+            updated = side & (
+                np.abs(residual - centre_resid)
+                < 3.0 * scatter
+            )
+
+            if (
+                updated.sum() < 10
+                or not np.any(v[updated] < initial)
+                or not np.any(v[updated] > initial)
+            ):
+                break
+
+            keep = updated
+
+        continuum = np.polyval(
+            np.polyfit(x_local[keep], f[keep], 1),
+            x_local,
+        )
+
+    if np.any(continuum <= 0):
+        raise ValueError("Invalid continuum.")
+
+    f = f / continuum
+
+    fit_mask = np.abs(v - initial) <= fit_half
+
+    if fit_mask.sum() < 15:
+        raise ValueError("Too few Gaussian-fit pixels.")
+
+    vv, ff = v[fit_mask], f[fit_mask]
+
+    depth0 = float(
+        np.clip(
+            1.0 - np.percentile(ff, 5),
+            0.01,
+            0.8,
+        )
+    )
+
+    lower = np.array([
+        0.85,
+        -0.15,
+        0.001,
+        initial - 100.0,
+        8.0,
+    ])
+    upper = np.array([
+        1.15,
+        0.15,
+        0.95,
+        initial + 100.0,
+        150.0,
+    ])
+
+    solutions = []
+
+    for width0 in (25.0, 50.0, 90.0):
+        try:
+            pars, _ = curve_fit(
+                gaussian_vel,
+                vv,
+                ff,
+                p0=[
+                    1.0,
+                    0.0,
+                    depth0,
+                    initial,
+                    width0,
+                ],
+                bounds=(lower, upper),
+                maxfev=30000,
+            )
+
+            rss = np.sum(
+                (ff - gaussian_vel(vv, *pars)) ** 2
+            )
+            solutions.append((rss, pars))
+
+        except (RuntimeError, ValueError):
+            continue
+
+    if not solutions:
+        raise RuntimeError(
+            "All Gaussian initialisations failed."
+        )
+
+    _, pars = min(
+        solutions,
+        key=lambda item: item[0],
+    )
+
+    boundary_distance = np.minimum(
+        (pars - lower) / (upper - lower),
+        (upper - pars) / (upper - lower),
+    )
+
+    return {
+        "v": v,
+        "flux": f,
+        "RV": float(pars[3]),
+        "bound_hit": bool(
+            np.any(boundary_distance < 0.001)
+        ),
+        "parameters": pars,
+    }
+
+
+# ============================================================
+# UNWEIGHTED LINEAR TRIAL-PERIOD FIT
+# Distinct from the existing weighted fit_fixed_period().
+# ============================================================
+
+def fit_trial_period(t, rv, period):
+    """Fit a sinusoid at a fixed trial period by linear least squares.
+
+    Inputs
+    ------
+    t
+        Finite times [days], preferably relative to an explicit reference.
+    rv
+        Paired finite RV values [km/s].
+    period
+        Positive trial period [days].
+
+    Returns
+    -------
+    rss
+        Residual sum of squares; infinity for a rank-deficient design.
+    coefficients
+        [offset, cosine coefficient, sine coefficient].
+        NOT the [gamma, K, phi] returned by fit_fixed_period().
+    predicted
+        Model at the supplied times; NaNs for a rank-deficient design.
+
+    Uses no measurement weights, amplitude bounds, period uncertainty
+    or significance calculation. Does not read, scan, plot or save.
+    """
+    t = np.asarray(t, dtype=float)
+    rv = np.asarray(rv, dtype=float)
+
+    if t.ndim != 1 or rv.ndim != 1 or t.size != rv.size:
+        raise ValueError(
+            "t and rv must be paired one-dimensional arrays."
+        )
+
+    if (
+        not np.all(np.isfinite(t))
+        or not np.all(np.isfinite(rv))
+    ):
+        raise ValueError(
+            "Select finite t/RV observations before fitting."
+        )
+
+    if not np.isfinite(period) or period <= 0:
+        raise ValueError(
+            "period must be finite and positive."
+        )
+
+    angle = 2.0 * np.pi * t / period
+
+    design = np.column_stack((
+        np.ones(len(t)),
+        np.cos(angle),
+        np.sin(angle),
+    ))
+
+    coefficients, _, rank, _ = np.linalg.lstsq(
+        design,
+        rv,
+        rcond=None,
+    )
+
+    if rank < 3:
+        return (
+            np.inf,
+            coefficients,
+            np.full(len(rv), np.nan),
+        )
+
+    predicted = design @ coefficients
+    rss = float(np.sum((rv - predicted) ** 2))
+
+    return rss, coefficients, predicted
 
 # ============================================================
 # 11. MULTI-LINE RV
@@ -513,3 +1028,36 @@ def run_rv_pipeline(specs, line_dict, window_dict=None, emission=False, period_r
 
     return results, {"periods": periods, "power": power, "frequency": frequency, "ls": ls, "best_period": best_period}, fit_data
 
+
+# ============================================================
+# 17. EXAMPLE NORMALIZATION FUNCTION FOR ONE FITS FILE
+# ============================================================
+
+def normalize_fits_file_interactive(fits_file, output_dir, template_dir=None, image_dir=None):
+    """Load one FITS spectrum and launch the interactive normalizer."""
+    if template_dir is None:
+        template_dir = os.path.join(output_dir, "templates")
+
+    if image_dir is None:
+        image_dir = os.path.join(output_dir, "images")
+
+    wave, flux, mjd = load_fits_spectrum(fits_file)
+
+    return normalize_spectrum_interactive(
+        wave,
+        flux,
+        filename=os.path.basename(fits_file),
+        output_dir=output_dir,
+        template_dir=template_dir,
+        image_dir=image_dir
+    )
+
+
+# ============================================================
+# 18. MAIN -- OPTIONAL TXT NORMALIZATION MODE
+# ============================================================
+
+if __name__ == "__main__":
+    print("toolkit.py loaded.")
+    print("Import this module and call normalize_spectrum_interactive()")
+    print("or normalize_fits_file_interactive() for interactive normalization.")
